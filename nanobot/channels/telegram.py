@@ -4,15 +4,23 @@ from __future__ import annotations
 
 import asyncio
 import re
+from typing import Any, TYPE_CHECKING
 from loguru import logger
-from telegram import BotCommand, Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+
+if TYPE_CHECKING:
+    from nanobot.session.manager import SessionManager
+from telegram import BotCommand, Update, InlineKeyboardButton, InlineKeyboardMarkup
+from nanobot.agent.job_tracker import job_manager
+from nanobot.system.hooks import hook_manager
+from telegram.constants import ChatAction
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 from telegram.request import HTTPXRequest
 
 from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.config.schema import TelegramConfig
+from nanobot.session.manager import SessionManager
 
 
 def _markdown_to_telegram_html(text: str) -> str:
@@ -99,10 +107,20 @@ class TelegramChannel(BaseChannel):
         config: TelegramConfig,
         bus: MessageBus,
         groq_api_key: str = "",
+        session_manager: SessionManager | None = None,
+        tool_executor: Any = None,
+        tool_definitions: list[dict[str, Any]] | None = None,
+        on_tool_call: Any = None,
+        is_session_busy: Any = None,
     ):
         super().__init__(config, bus)
         self.config: TelegramConfig = config
         self.groq_api_key = groq_api_key
+        self.session_manager = session_manager
+        self.tool_executor = tool_executor
+        self.tool_definitions = tool_definitions or []
+        self.on_tool_call = on_tool_call
+        self.is_session_busy = is_session_busy
         self._app: Application | None = None
         self._chat_ids: dict[str, int] = {}  # Map sender_id to chat_id for replies
         self._typing_tasks: dict[str, asyncio.Task] = {}  # chat_id -> typing loop task
@@ -117,6 +135,7 @@ class TelegramChannel(BaseChannel):
         
         # Build the application with larger connection pool to avoid pool-timeout on long runs
         req = HTTPXRequest(connection_pool_size=16, pool_timeout=5.0, connect_timeout=30.0, read_timeout=30.0)
+        
         builder = Application.builder().token(self.config.token).request(req).get_updates_request(req)
         if self.config.proxy:
             builder = builder.proxy(self.config.proxy).get_updates_proxy(self.config.proxy)
@@ -131,11 +150,18 @@ class TelegramChannel(BaseChannel):
         # Add message handler for text, photos, voice, documents
         self._app.add_handler(
             MessageHandler(
-                (filters.TEXT | filters.PHOTO | filters.VOICE | filters.AUDIO | filters.Document.ALL) 
-                & ~filters.COMMAND, 
+                (filters.TEXT | filters.PHOTO | filters.VOICE | filters.AUDIO | filters.Document.ALL)
+                & ~filters.COMMAND,
                 self._on_message
             )
         )
+        
+        # Add callback query handler for inline buttons - only handle restart_gateway callbacks
+        # Other callbacks (job_progress, job:expand, etc.) are handled by plugins via telegram.init hook
+        self._app.add_handler(CallbackQueryHandler(self._on_callback, pattern="^restart_gateway:"))
+        
+        # Note: Additional callback handlers should be registered via the telegram.init hook
+        # to avoid conflicts with the plugin system's callback handling
         
         logger.info("Starting Telegram bot (polling mode)...")
         
@@ -147,21 +173,43 @@ class TelegramChannel(BaseChannel):
         bot_info = await self._app.bot.get_me()
         logger.info(f"Telegram bot @{bot_info.username} connected")
         
+        # NEW: Allow plugins to register handlers and modify BOT_COMMANDS
+        from nanobot.system.hooks import hook_manager
+        await hook_manager.emit("telegram.init", app=self._app, channel=self)
+
         try:
-            await self._app.bot.set_my_commands(self.BOT_COMMANDS)
-            logger.debug("Telegram bot commands registered")
+            # Deduplicate commands by name
+            unique_commands = {}
+            for cmd in self.BOT_COMMANDS:
+                unique_commands[cmd.command] = cmd
+            
+            await self._app.bot.set_my_commands(list(unique_commands.values()))
+            logger.debug(f"Telegram bot commands registered ({len(unique_commands)} commands)")
         except Exception as e:
             logger.warning(f"Failed to register bot commands: {e}")
         
         # Start polling (this runs until stopped)
-        await self._app.updater.start_polling(
-            allowed_updates=["message"],
-            drop_pending_updates=True  # Ignore old messages on startup
-        )
+        try:
+            await self._app.updater.start_polling(
+                allowed_updates=["message", "callback_query"],
+                drop_pending_updates=True,  # Ignore old messages on startup
+                poll_interval=1.0,  # Add delay between polls to reduce connection issues
+                timeout=30  # Increase timeout for get_updates
+            )
+        except Exception as e:
+            logger.error(f"Error starting Telegram polling: {e}")
+            raise
         
-        # Keep running until stopped
+        # Keep running until stopped with error recovery
         while self._running:
-            await asyncio.sleep(1)
+            try:
+                await asyncio.sleep(1)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Error in Telegram polling loop: {e}")
+                # Brief pause before continuing to avoid rapid error loops
+                await asyncio.sleep(2)
     
     async def stop(self) -> None:
         """Stop the Telegram bot."""
@@ -192,10 +240,109 @@ class TelegramChannel(BaseChannel):
             chat_id = int(msg.chat_id)
             # Convert markdown to Telegram HTML
             html_content = _markdown_to_telegram_html(msg.content)
+            
+            # Validate HTML content
+            if not html_content or len(html_content.strip()) == 0:
+                logger.warning(f"HTML conversion produced empty content, using escaped original")
+                html_content = msg.content.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            
+            # Check if we should edit an existing job message
+            job_id = msg.metadata.get("job_id")
+            is_intermediate = msg.metadata.get("intermediate", False)
+            
+            if job_id:
+                job = await job_manager.get_job(job_id)
+                if job and job.message_id:
+                    try:
+                        # ASSERT: We should only be editing timeline messages, not already-consumed text messages
+                        # If job.message_id exists but was already consumed, that's a bug
+                        message_id_int = int(job.message_id)
+                        
+                        # CRITICAL FIX: Clear job.message_id IMMEDIATELY to prevent race condition
+                        # where _update_timeline finds job.message_id still set after message is consumed
+                        consumed_msg_id = int(job.message_id)
+                        await job_manager.set_message_id(job_id, None)
+                        logger.info(f"[RACE-FIX] Cleared job.message_id for job {job_id} before consuming message {consumed_msg_id}")
+                        
+                        # CRITICAL: Remove from timeline cache BEFORE editing to prevent race condition
+                        # where _update_timeline edits it back to timeline while we're converting to text
+                        await hook_manager.emit("telegram.timeline.consumed",
+                            job_id=job_id,
+                            message_id=consumed_msg_id
+                        )
+                        logger.info(f"Pre-emptively removed job {job_id} from timeline cache before editing message {consumed_msg_id}")
+                        
+                        # Edit the current timeline message to show the content
+                        # CRITICAL: Remove reply_markup to clear inline keyboard buttons
+                        from telegram import InlineKeyboardMarkup
+                        logger.info(f"[RACE-FIX] Editing consumed message {consumed_msg_id} for job {job_id} (job.message_id is now None)")
+                        await self._app.bot.edit_message_text(
+                            chat_id=chat_id,
+                            message_id=consumed_msg_id,
+                            text=html_content,
+                            parse_mode="HTML",
+                            reply_markup=InlineKeyboardMarkup([])  # Force remove inline keyboard
+                        )
+                        logger.info(f"[RACE-FIX] Successfully edited message {consumed_msg_id} for job {job_id}")
+                        
+                        # Handle post-consumption logic (request new timeline if intermediate)
+                        await self._consume_timeline(job_id, consumed_msg_id, is_intermediate, chat_id)
+                        
+                        return
+                    except Exception as e:
+                        if "message is not modified" in str(e).lower():
+                            logger.info(f"Message {job.message_id} not modified (same content)")
+                            return
+                        logger.error(f"Failed to edit job message {job.message_id} with HTML: {e}")
+                        # Try editing with plain text instead
+                        try:
+                            # Remove from cache before editing (race condition prevention)
+                            await hook_manager.emit("telegram.timeline.consumed",
+                                job_id=job_id,
+                                message_id=int(job.message_id)
+                            )
+                            
+                            logger.info(f"Retrying edit with plain text for job {job_id}")
+                            await self._app.bot.edit_message_text(
+                                chat_id=chat_id,
+                                message_id=int(job.message_id),
+                                text=msg.content,
+                                parse_mode=None,  # No parsing
+                                reply_markup=None  # Remove inline keyboard
+                            )
+                            logger.info(f"Successfully edited message {job.message_id} with plain text")
+                            
+                            # Handle post-consumption logic (clear message_id, request new timeline if intermediate)
+                            await self._consume_timeline(job_id, int(job.message_id), is_intermediate, chat_id, source="plain text")
+                            
+                            return
+                        except Exception as e2:
+                            logger.error(f"Failed to edit with plain text too: {e2}")
+                            # Editing failed - we must still send the content
+                            # The old timeline will remain, which is unfortunate but we can't delete it
+                            logger.warning(f"Timeline editing failed for job {job_id}, sending content as new message")
+
+            # Check for reply_markup (inline keyboard) in metadata
+            reply_markup = None
+            if msg.metadata and "reply_markup" in msg.metadata:
+                from telegram import InlineKeyboardMarkup, InlineKeyboardButton
+                keyboard_data = msg.metadata["reply_markup"]
+                keyboard = []
+                for row in keyboard_data.get("inline_keyboard", []):
+                    keyboard_row = []
+                    for button in row:
+                        keyboard_row.append(InlineKeyboardButton(
+                            text=button["text"],
+                            callback_data=button["callback_data"]
+                        ))
+                    keyboard.append(keyboard_row)
+                reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
+            
             await self._app.bot.send_message(
                 chat_id=chat_id,
                 text=html_content,
-                parse_mode="HTML"
+                parse_mode="HTML",
+                reply_markup=reply_markup
             )
         except ValueError:
             logger.error(f"Invalid chat_id: {msg.chat_id}")
@@ -315,9 +462,43 @@ class TelegramChannel(BaseChannel):
         logger.debug(f"Telegram message from {sender_id}: {content[:50]}...")
         
         str_chat_id = str(chat_id)
+        session_key = f"telegram:{str_chat_id}"
         
         # Start typing indicator before processing
         self._start_typing(str_chat_id)
+        
+        # Check if session is busy - if so, use existing job instead of creating new one
+        # The message will be queued in the agent loop and injected mid-operation
+        job_id_for_metadata = None
+        if self.is_session_busy and self.is_session_busy(session_key):
+            # Get the last active job for this session
+            from nanobot.agent.job_tracker import job_manager
+            last_job = await job_manager.get_last_job(session_key)
+            if last_job:
+                job_id_for_metadata = last_job.id
+                logger.info(f"Session {session_key} is busy, using existing job {last_job.id}")
+            else:
+                logger.info(f"Session {session_key} is busy but no active job found")
+        else:
+            # Create job for tracking and emit hook for timeline creation
+            from nanobot.agent.job_tracker import job_manager
+            
+            job = await job_manager.create_job(
+                session_key=session_key,
+                channel="telegram",
+                chat_id=str_chat_id,
+                user_message=content,
+            )
+            job_id_for_metadata = job.id
+            
+            # Emit hook to create initial timeline
+            logger.info(f"DEBUG: About to emit agent.job.created hook for job {job.id}")
+            await hook_manager.emit("agent.job.created",
+                job=job,
+                channel="telegram",
+                chat_id=str_chat_id,
+            )
+            logger.info(f"DEBUG: Emitted agent.job.created hook for job {job.id}")
         
         # Forward to the message bus
         await self._handle_message(
@@ -330,7 +511,8 @@ class TelegramChannel(BaseChannel):
                 "user_id": user.id,
                 "username": user.username,
                 "first_name": user.first_name,
-                "is_group": message.chat.type != "private"
+                "is_group": message.chat.type != "private",
+                "job_id": job_id_for_metadata,
             }
         )
     
@@ -350,7 +532,7 @@ class TelegramChannel(BaseChannel):
         """Repeatedly send 'typing' action until cancelled."""
         try:
             while self._app:
-                await self._app.bot.send_chat_action(chat_id=int(chat_id), action="typing")
+                await self._app.bot.send_chat_action(chat_id=int(chat_id), action=ChatAction.TYPING)
                 await asyncio.sleep(4)
         except asyncio.CancelledError:
             pass
@@ -361,6 +543,100 @@ class TelegramChannel(BaseChannel):
         """Log polling / handler errors instead of silently swallowing them."""
         logger.error(f"Telegram error: {context.error}")
 
+    async def _consume_timeline(self, job_id: str, message_id: int, is_intermediate: bool, chat_id: int, source: str = "") -> None:
+        """Common logic after consuming a timeline message (converting to text).
+        
+        Removes from cache, clears job.message_id, and requests new timeline if intermediate.
+        """
+        # Clear job.message_id so subsequent messages create NEW messages
+        await job_manager.set_message_id(job_id, None)
+        logger.info(f"Cleared message_id for job {job_id} after consuming message {message_id}")
+        
+        # If this is an intermediate message, request a new timeline from plugin
+        if is_intermediate:
+            await self._request_timeline_creation(job_id, chat_id, source)
+    
+    async def _request_timeline_creation(self, job_id: str, chat_id: int, source: str = "") -> None:
+        """Request the plugin to create a new timeline after intermediate message.
+        
+        This centralizes timeline creation requests to avoid race conditions.
+        All timeline creation should go through the plugin via hooks.
+        """
+        source_str = f" ({source})" if source else ""
+        logger.info(f"Requesting new timeline for job {job_id}{source_str}")
+        await asyncio.sleep(0.1)
+        
+        # Emit the hook - the plugin (core.py) will handle timeline creation with proper locking
+        try:
+            await hook_manager.emit("telegram.timeline.create_request",
+                job_id=job_id,
+                chat_id=chat_id
+            )
+        except Exception as e:
+            logger.error(f"Error requesting timeline creation for job {job_id}: {e}")
+
+    async def _on_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle callback queries from inline buttons."""
+        if not update.callback_query:
+            logger.debug("[TELEGRAM-CALLBACK] No callback_query in update")
+            return
+        
+        query = update.callback_query
+        data = query.data or ""
+        
+        logger.info(f"[TELEGRAM-CALLBACK] Received callback: {data[:50]}...")
+        
+        # Acknowledge the callback immediately to prevent timeout
+        try:
+            await query.answer()
+        except Exception as e:
+            logger.warning(f"[TELEGRAM-CALLBACK] Failed to answer callback: {e}")
+        
+        # Handle restart gateway confirmation
+        if data.startswith("restart_gateway:"):
+            parts = data.split(":")
+            action = parts[1] if len(parts) > 1 else ""
+            force = parts[2] == "force" if len(parts) > 2 else False
+            
+            if action == "confirm":
+                # User confirmed restart - execute directly without agent
+                await query.answer("Restarting gateway...")
+                await query.edit_message_text("🔄 Restarting gateway...")
+                
+                try:
+                    # Import here to avoid circular dependencies
+                    from nanobot.agent.tools.gateway import write_restart_marker
+                    import asyncio
+                    
+                    chat_id = str(update.effective_chat.id) if update.effective_chat else ""
+                    
+                    # Write restart marker for confirmation message
+                    if chat_id:
+                        write_restart_marker(chat_id, "telegram", f"telegram:{chat_id}")
+                    
+                    # Spawn new gateway process
+                    import sys
+                    cmd = [sys.executable, "-m", "nanobot", "gateway", "--force"]
+                    if force:
+                        cmd.append("--force")
+                    
+                    process = await asyncio.create_subprocess_exec(
+                        *cmd,
+                        stdout=None,
+                        stderr=None,
+                        start_new_session=True,
+                    )
+                    
+                    logger.info(f"Gateway restart triggered by user button click: PID {process.pid}")
+                    
+                except Exception as e:
+                    logger.error(f"Failed to restart gateway from callback: {e}")
+                    await query.edit_message_text(f"❌ Failed to restart: {e}")
+            
+            elif action == "cancel":
+                await query.answer("Restart cancelled")
+                await query.edit_message_text("❌ Gateway restart cancelled.")
+    
     def _get_extension(self, media_type: str, mime_type: str | None) -> str:
         """Get file extension based on media type."""
         if mime_type:
