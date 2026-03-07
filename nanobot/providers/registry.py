@@ -12,7 +12,7 @@ Every entry writes out all fields so you can copy-paste as a template.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from pydantic.alias_generators import to_snake
@@ -53,6 +53,11 @@ class ProviderSpec:
 
     # per-model param overrides, e.g. (("kimi-k2.5", {"temperature": 1.0}),)
     model_overrides: tuple[tuple[str, dict[str, Any]], ...] = ()
+
+    # LiteLLM prefix/kwargs for gateway providers
+    litellm_prefix: str = ""
+    skip_prefixes: tuple[str, ...] = ()
+    litellm_kwargs: dict[str, Any] = field(default_factory=dict)
 
     # OAuth-based providers (e.g., OpenAI Codex) don't use API keys
     is_oauth: bool = False
@@ -181,7 +186,24 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         default_api_base="https://ark.ap-southeast.bytepluses.com/api/coding/v3",
         strip_model_prefix=True,
     ),
-
+    ProviderSpec(
+        name="kilocode",
+        keywords=("kilocode", "kilo", "z-ai"),
+        env_key="OPENAI_API_KEY",
+        display_name="Kilo Code",
+        litellm_prefix="",
+        skip_prefixes=("kilo/",),
+        env_extras=(
+            ("KILOCODE_API_KEY", "{api_key}"),
+        ),
+        is_gateway=True,
+        is_local=False,
+        detect_by_key_prefix="",
+        detect_by_base_keyword="kilo.ai",
+        default_api_base="https://api.kilo.ai/api/openrouter",
+        strip_model_prefix=False,
+        model_overrides=(),
+    ),
 
     # === Standard providers (matched by model-name keywords) ===============
     # Anthropic: native Anthropic SDK
@@ -249,6 +271,30 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         backend="openai_compat",
         env_extras=(("ZHIPUAI_API_KEY", "{api_key}"),),
         default_api_base="https://open.bigmodel.cn/api/paas/v4",
+    ),
+    ProviderSpec(
+        name="zaicoding",
+        keywords=("zaicoding",),
+        env_key="OPENAI_API_KEY",
+        display_name="Z.ai Coding",
+        litellm_prefix="openai",
+        skip_prefixes=("zaicoding/",),
+        is_gateway=True,
+        detect_by_base_keyword="z.ai",
+        default_api_base="https://api.z.ai/api/coding/paas/v4",
+        strip_model_prefix=True,
+    ),
+    ProviderSpec(
+        name="zaicodingplan",
+        keywords=("zaicodingplan",),
+        env_key="OPENAI_API_KEY",
+        display_name="Z.ai Coding Plan",
+        litellm_prefix="openai",
+        skip_prefixes=("zaicodingplan/",),
+        is_gateway=True,
+        detect_by_base_keyword="z.ai",
+        default_api_base="https://api.z.ai/api/coding/paas/v4",
+        strip_model_prefix=True,
     ),
     # DashScope (通义): Qwen models, OpenAI-compatible endpoint
     ProviderSpec(

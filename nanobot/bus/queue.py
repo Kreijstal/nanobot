@@ -16,6 +16,7 @@ class MessageBus:
     def __init__(self):
         self.inbound: asyncio.Queue[InboundMessage] = asyncio.Queue()
         self.outbound: asyncio.Queue[OutboundMessage] = asyncio.Queue()
+        self._outbound_subscribers: dict[str, callable] = {}
 
     async def publish_inbound(self, msg: InboundMessage) -> None:
         """Publish a message from a channel to the agent."""
@@ -28,10 +29,24 @@ class MessageBus:
     async def publish_outbound(self, msg: OutboundMessage) -> None:
         """Publish a response from the agent to channels."""
         await self.outbound.put(msg)
+        for handler in self._outbound_subscribers.values():
+            try:
+                await handler(msg)
+            except Exception as e:
+                import logging
+                logging.getLogger(__name__).error(f"Outbound subscriber error: {e}")
 
     async def consume_outbound(self) -> OutboundMessage:
         """Consume the next outbound message (blocks until available)."""
         return await self.outbound.get()
+
+    def subscribe_outbound(self, name: str, handler: callable) -> None:
+        """Subscribe to outbound messages."""
+        self._outbound_subscribers[name] = handler
+
+    def unsubscribe_outbound(self, name: str) -> None:
+        """Unsubscribe from outbound messages."""
+        self._outbound_subscribers.pop(name, None)
 
     @property
     def inbound_size(self) -> int:

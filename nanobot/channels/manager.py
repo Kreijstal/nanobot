@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Any
+from typing import Any, Callable, Coroutine, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from nanobot.session.manager import SessionManager
 
 from loguru import logger
 
@@ -26,9 +29,23 @@ class ChannelManager:
     - Route outbound messages
     """
 
-    def __init__(self, config: Config, bus: MessageBus):
+    def __init__(
+        self,
+        config: Config,
+        bus: MessageBus,
+        session_manager: "SessionManager | None" = None,
+        tool_executor: Any = None,
+        tool_definitions: list[dict[str, Any]] | None = None,
+        on_tool_call: "Callable[[str, dict[str, Any], str, str, str, str | None], Coroutine[Any, Any, None]] | None" = None,
+        is_session_busy: "Callable[[str], bool] | None" = None,
+    ):
         self.config = config
         self.bus = bus
+        self.session_manager = session_manager
+        self.tool_executor = tool_executor
+        self.tool_definitions = tool_definitions or []
+        self.on_tool_call = on_tool_call
+        self.is_session_busy = is_session_busy
         self.channels: dict[str, BaseChannel] = {}
         self._dispatch_task: asyncio.Task | None = None
 
@@ -52,10 +69,28 @@ class ChannelManager:
             if not enabled:
                 continue
             try:
-                channel = cls(section, self.bus)
-                channel.transcription_api_key = groq_key
+                # Pass hook-based params to channels that support them
+                channel = cls(
+                    section,
+                    self.bus,
+                    groq_api_key=groq_key,
+                    session_manager=self.session_manager,
+                    tool_executor=self.tool_executor,
+                    tool_definitions=self.tool_definitions,
+                    on_tool_call=self.on_tool_call,
+                    is_session_busy=self.is_session_busy,
+                )
                 self.channels[name] = channel
                 logger.info("{} channel enabled", cls.display_name)
+            except TypeError:
+                # Fallback for channels that don't support hook params
+                try:
+                    channel = cls(section, self.bus)
+                    channel.transcription_api_key = groq_key
+                    self.channels[name] = channel
+                    logger.info("{} channel enabled", cls.display_name)
+                except Exception as e:
+                    logger.warning("{} channel not available: {}", name, e)
             except Exception as e:
                 logger.warning("{} channel not available: {}", name, e)
 
@@ -251,10 +286,7 @@ class ChannelManager:
     def get_status(self) -> dict[str, Any]:
         """Get status of all channels."""
         return {
-            name: {
-                "enabled": True,
-                "running": channel.is_running
-            }
+            name: {"enabled": True, "running": channel.is_running}
             for name, channel in self.channels.items()
         }
 
