@@ -515,9 +515,11 @@ def gateway(
     workspace: str | None = typer.Option(None, "--workspace", "-w", help="Workspace directory"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose output"),
     config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
+    force: bool = typer.Option(False, "--force", "-f", help="Force kill existing gateway processes"),
 ):
     """Start the nanobot gateway."""
     from nanobot.agent.loop import AgentLoop
+    from nanobot.agent.loop_telegram import TelegramAgentLoop
     from nanobot.bus.queue import MessageBus
     from nanobot.channels.manager import ChannelManager
     from nanobot.config.paths import get_cron_dir
@@ -529,6 +531,19 @@ def gateway(
     if verbose:
         import logging
         logging.basicConfig(level=logging.DEBUG)
+
+    if force:
+        import subprocess
+        try:
+            result = subprocess.run(
+                ["pkill", "-9", "-f", "python -m nanobot gateway"],
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode == 0:
+                console.print("🔪 Force killed existing gateway processes")
+        except Exception:
+            pass
 
     config = _load_runtime_config(config, workspace)
     port = port if port is not None else config.gateway.port
@@ -543,8 +558,17 @@ def gateway(
     cron_store_path = get_cron_dir() / "jobs.json"
     cron = CronService(cron_store_path)
 
+    # Use TelegramAgentLoop if Telegram is enabled (for timeline hooks, job tracking)
+    # otherwise fall back to basic AgentLoop
+    telegram_cfg = config.channels.telegram
+    if isinstance(telegram_cfg, dict):
+        use_telegram_loop = telegram_cfg.get("enabled", False) and telegram_cfg.get("token")
+    else:
+        use_telegram_loop = telegram_cfg.enabled and telegram_cfg.token
+    AgentLoopClass = TelegramAgentLoop if use_telegram_loop else AgentLoop
+
     # Create agent with cron service
-    agent = AgentLoop(
+    agent = AgentLoopClass(
         bus=bus,
         provider=provider,
         workspace=config.workspace_path,
@@ -609,8 +633,22 @@ def gateway(
         return response
     cron.on_job = on_cron_job
 
+    # Initialize plugins (registers hooks for Telegram UI, job tracking, etc.)
+    from nanobot import plugins
+    plugins.init()
+    
+    # Initialize job manager for tracking long-running tasks
+    from nanobot.agent.job_tracker import job_manager
+    job_manager._persist_dir = config.workspace_path / ".nanobot"
+    job_manager._persist_file = job_manager._persist_dir / "jobs.json"
+    
     # Create channel manager
-    channels = ChannelManager(config, bus)
+    channels = ChannelManager(
+        config,
+        bus,
+        session_manager=session_manager,
+        is_session_busy=agent._is_processing,
+    )
 
     def _pick_heartbeat_target() -> tuple[str, str]:
         """Pick a routable channel/chat target for heartbeat-triggered messages."""
@@ -674,15 +712,30 @@ def gateway(
         console.print(f"[green]✓[/green] Cron: {cron_status['jobs']} scheduled jobs")
 
     console.print(f"[green]✓[/green] Heartbeat: every {hb_cfg.interval_s}s")
+    
+    # Start WebSocket server for TUI/web clients
+    ws_server = None
+    try:
+        from nanobot.bus.ws_server import BusWebSocketServer
+        ws_server = BusWebSocketServer(bus, host="localhost", port=8765)
+        console.print("[green]✓[/green] WebSocket: ws://localhost:8765")
+    except ImportError:
+        console.print("[yellow]WebSocket: not available (install 'websockets' package)[/yellow]")
 
     async def run():
+        nonlocal ws_server
         try:
+            # Emit gateway.start hook so plugins can get agent reference
+            from nanobot.system.hooks import hook_manager
+            await hook_manager.emit("gateway.start", agent=agent, config=config)
+            
             await cron.start()
             await heartbeat.start()
-            await asyncio.gather(
-                agent.run(),
-                channels.start_all(),
-            )
+            if ws_server:
+                await ws_server.start()
+            
+            tasks = [agent.run(), channels.start_all()]
+            await asyncio.gather(*tasks)
         except KeyboardInterrupt:
             console.print("\nShutting down...")
         except Exception:
@@ -695,6 +748,8 @@ def gateway(
             cron.stop()
             agent.stop()
             await channels.stop_all()
+            if ws_server:
+                await ws_server.stop()
 
     asyncio.run(run())
 

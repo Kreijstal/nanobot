@@ -75,6 +75,7 @@ def _format_results(query: str, items: list[dict[str, Any]], n: int) -> str:
 class WebSearchTool(Tool):
     """Search the web using configured provider."""
 
+
     name = "web_search"
     description = "Search the web. Returns titles, URLs, and snippets."
     parameters = {

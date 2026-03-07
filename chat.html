@@ -1,0 +1,321 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>nanobot chat</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+            background: #1a1a2e;
+            color: #eee;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+        
+        .header {
+            background: #16213e;
+            padding: 12px 20px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            border-bottom: 1px solid #0f3460;
+        }
+        
+        .header h1 {
+            font-size: 18px;
+            color: #e94560;
+        }
+        
+        .status {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 14px;
+        }
+        
+        .status-dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            background: #e94560;
+        }
+        
+        .status-dot.connected {
+            background: #4ecca3;
+        }
+        
+        .chat-container {
+            flex: 1;
+            overflow-y: auto;
+            padding: 20px;
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+        }
+        
+        .message {
+            max-width: 80%;
+            padding: 12px 16px;
+            border-radius: 16px;
+            line-height: 1.5;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+        }
+        
+        .message.user {
+            align-self: flex-end;
+            background: #0f3460;
+            border-bottom-right-radius: 4px;
+        }
+        
+        .message.agent {
+            align-self: flex-start;
+            background: #16213e;
+            border-bottom-left-radius: 4px;
+        }
+        
+        .message.system {
+            align-self: center;
+            background: transparent;
+            color: #888;
+            font-size: 13px;
+        }
+        
+        .message.error {
+            align-self: center;
+            background: #e9456020;
+            border: 1px solid #e94560;
+            color: #e94560;
+        }
+        
+        .input-container {
+            padding: 16px 20px;
+            background: #16213e;
+            border-top: 1px solid #0f3460;
+            display: flex;
+            gap: 12px;
+        }
+        
+        .input-container input {
+            flex: 1;
+            padding: 12px 16px;
+            border: none;
+            border-radius: 24px;
+            background: #0f3460;
+            color: #eee;
+            font-size: 15px;
+            outline: none;
+        }
+        
+        .input-container input::placeholder {
+            color: #666;
+        }
+        
+        .input-container button {
+            padding: 12px 24px;
+            border: none;
+            border-radius: 24px;
+            background: #e94560;
+            color: white;
+            font-size: 15px;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+        
+        .input-container button:hover {
+            background: #ff6b6b;
+        }
+        
+        .input-container button:disabled {
+            background: #333;
+            cursor: not-allowed;
+        }
+        
+        .connect-form {
+            padding: 20px;
+            background: #16213e;
+            border-top: 1px solid #0f3460;
+        }
+        
+        .connect-form label {
+            display: block;
+            margin-bottom: 6px;
+            font-size: 13px;
+            color: #888;
+        }
+        
+        .connect-form input {
+            width: 100%;
+            padding: 10px 14px;
+            border: none;
+            border-radius: 8px;
+            background: #0f3460;
+            color: #eee;
+            font-size: 14px;
+            margin-bottom: 12px;
+            outline: none;
+        }
+        
+        .connect-form button {
+            width: 100%;
+            padding: 12px;
+            border: none;
+            border-radius: 8px;
+            background: #e94560;
+            color: white;
+            font-size: 15px;
+            cursor: pointer;
+        }
+        
+        .hidden {
+            display: none !important;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>🐱 nanobot</h1>
+        <div class="status">
+            <div class="status-dot" id="statusDot"></div>
+            <span id="statusText">disconnected</span>
+        </div>
+    </div>
+    
+    <div class="chat-container" id="chatContainer">
+        <div class="message system">Welcome to nanobot chat! Connect to start.</div>
+    </div>
+    
+    <div class="connect-form" id="connectForm">
+        <label>WebSocket URL</label>
+        <input type="text" id="wsUrl" value="ws://localhost:8765" placeholder="ws://localhost:8765">
+        <label>Chat ID</label>
+        <input type="text" id="chatId" value="web-user" placeholder="web-user">
+        <button onclick="connect()">Connect</button>
+    </div>
+    
+    <div class="input-container hidden" id="inputContainer">
+        <input type="text" id="messageInput" placeholder="Type a message..." onkeypress="handleKeyPress(event)">
+        <button id="sendBtn" onclick="sendMessage()">Send</button>
+    </div>
+
+    <script>
+        let ws = null;
+        let chatId = 'web-user';
+        
+        function addMessage(content, type = 'agent') {
+            const container = document.getElementById('chatContainer');
+            const msg = document.createElement('div');
+            msg.className = `message ${type}`;
+            msg.textContent = content;
+            container.appendChild(msg);
+            container.scrollTop = container.scrollHeight;
+        }
+        
+        function updateStatus(connected) {
+            const dot = document.getElementById('statusDot');
+            const text = document.getElementById('statusText');
+            const sendBtn = document.getElementById('sendBtn');
+            
+            if (connected) {
+                dot.classList.add('connected');
+                text.textContent = 'connected';
+                sendBtn.disabled = false;
+            } else {
+                dot.classList.remove('connected');
+                text.textContent = 'disconnected';
+                sendBtn.disabled = true;
+            }
+        }
+        
+        function connect() {
+            const url = document.getElementById('wsUrl').value;
+            chatId = document.getElementById('chatId').value || 'web-user';
+            
+            try {
+                ws = new WebSocket(url);
+            } catch (e) {
+                addMessage('Invalid WebSocket URL: ' + e.message, 'error');
+                return;
+            }
+            
+            ws.onopen = () => {
+                addMessage('Connected to nanobot gateway', 'system');
+                updateStatus(true);
+                document.getElementById('connectForm').classList.add('hidden');
+                document.getElementById('inputContainer').classList.remove('hidden');
+                document.getElementById('messageInput').focus();
+            };
+            
+            ws.onclose = () => {
+                addMessage('Disconnected from gateway', 'system');
+                updateStatus(false);
+                document.getElementById('connectForm').classList.remove('hidden');
+                document.getElementById('inputContainer').classList.add('hidden');
+            };
+            
+            ws.onerror = (e) => {
+                addMessage('WebSocket error - is the gateway running?', 'error');
+            };
+            
+            ws.onmessage = (event) => {
+                try {
+                    const data = JSON.parse(event.data);
+                    
+                    if (data.type === 'message') {
+                        addMessage(data.content, 'agent');
+                    } else if (data.type === 'status') {
+                        addMessage(`Connected (${data.clients} client(s))`, 'system');
+                    } else if (data.type === 'error') {
+                        addMessage('Error: ' + data.message, 'error');
+                    }
+                } catch (e) {
+                    addMessage('Received: ' + event.data, 'agent');
+                }
+            };
+        }
+        
+        function sendMessage() {
+            const input = document.getElementById('messageInput');
+            const content = input.value.trim();
+            
+            if (!content || !ws || ws.readyState !== WebSocket.OPEN) {
+                return;
+            }
+            
+            const message = {
+                type: 'message',
+                content: content,
+                channel: 'web',
+                chat_id: chatId
+            };
+            
+            ws.send(JSON.stringify(message));
+            addMessage(content, 'user');
+            input.value = '';
+        }
+        
+        function handleKeyPress(event) {
+            if (event.key === 'Enter') {
+                sendMessage();
+            }
+        }
+        
+        // Auto-connect if URL has parameters
+        window.onload = () => {
+            const params = new URLSearchParams(window.location.search);
+            const autoConnect = params.get('connect');
+            if (autoConnect === 'true') {
+                connect();
+            }
+        };
+    </script>
+</body>
+</html>
